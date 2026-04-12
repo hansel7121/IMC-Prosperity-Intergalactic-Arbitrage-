@@ -9,15 +9,18 @@ class Trader:
         "TOMATOES": 20,
     }
 
-    # Emeralds: tight market-making spread around fixed fair value
+    # ── EMERALDS: fixed fair-value market making ───────────────────────────────
     EMERALD_FV = 10000
     EMERALD_SPREAD = 1
 
-    # Bollinger Band parameters for TOMATOES
+    # ── TOMATOES: inside-spread market making + inventory skew ────────────────
+    OFFSET = 3  # half-spread we quote around fair value (ticks)
+    SKEW_FACTOR = 0.5  # ticks of quote skew per unit of inventory
+    SOFT_LIMIT = 15  # max abs position before we stop adding inventory
     BB_WINDOW = 20
     BB_NUM_STD = 2.0
-    MAX_TRADE_SIZE = 20
 
+    # =========================================================================
     def run(self, state: TradingState):
         result = {}
         trader_state = jsonpickle.decode(state.traderData) if state.traderData else {}
@@ -35,16 +38,14 @@ class Trader:
 
             elif product == "TOMATOES":
                 orders, trader_state = self._trade_tomatoes(
-                    order_depth, position, limit, trader_state
+                    order_depth, position, trader_state
                 )
 
             result[product] = orders
 
         return result, 0, jsonpickle.encode(trader_state)
 
-    # ------------------------------------------------------------------
-    # EMERALDS — fixed fair-value market making
-    # ------------------------------------------------------------------
+    # =========================================================================
     def _trade_emeralds(
         self, order_depth: OrderDepth, position: int, limit: int
     ) -> List[Order]:
@@ -76,86 +77,77 @@ class Trader:
 
         return orders
 
-    # ------------------------------------------------------------------
-    # TOMATOES — Bollinger Band mean-reversion
-    #
-    # Position-limit safety: the engine cancels ALL orders for a product
-    # if worst-case position exceeds the limit IN EITHER DIRECTION.
-    # It checks buy side and sell side independently:
-    #   real_position + total_buy_qty  <= limit
-    #   real_position - total_sell_qty >= -limit
-    #
-    # To avoid submitting mixed-direction orders that trip this check,
-    # we never enter on the same tick as an exit.
-    # ------------------------------------------------------------------
+    # =========================================================================
     def _trade_tomatoes(
         self,
         order_depth: OrderDepth,
         position: int,
-        limit: int,
         trader_state: dict,
     ):
         orders: List[Order] = []
 
-        # ---- compute mid price ----
         if not order_depth.buy_orders or not order_depth.sell_orders:
             return orders, trader_state
 
+        # ── market snapshot ───────────────────────────────────────────────────
         best_bid = max(order_depth.buy_orders.keys())
         best_ask = min(order_depth.sell_orders.keys())
-        bid_vol = order_depth.buy_orders[best_bid]
-        ask_vol = -order_depth.sell_orders[best_ask]
         mid = (best_bid + best_ask) / 2.0
 
-        # ---- update rolling mid-price history ----
+        total_bid_vol = sum(order_depth.buy_orders.values())
+        total_ask_vol = sum(abs(v) for v in order_depth.sell_orders.values())
+
+        # ── rolling price history for BB trend filter ─────────────────────────
         prices: list = trader_state.get("tom_prices", [])
         prices.append(mid)
         if len(prices) > self.BB_WINDOW:
             prices = prices[-self.BB_WINDOW :]
         trader_state["tom_prices"] = prices
 
-        # ---- need a full window before trading ----
-        if len(prices) < self.BB_WINDOW:
-            return orders, trader_state
+        if len(prices) >= self.BB_WINDOW:
+            mean = sum(prices) / len(prices)
+            variance = sum((p - mean) ** 2 for p in prices) / len(prices)
+            std = variance**0.5
+            upper = mean + self.BB_NUM_STD * std
+            lower = mean - self.BB_NUM_STD * std
+        else:
+            upper = mid + 9999
+            lower = mid - 9999
 
-        # ---- compute Bollinger Bands (population std, ddof=0) ----
-        mean = sum(prices) / len(prices)
-        variance = sum((p - mean) ** 2 for p in prices) / len(prices)
-        std = variance**0.5
-        upper = mean + self.BB_NUM_STD * std
-        lower = mean - self.BB_NUM_STD * std
+        # ── quote prices with inventory skew ──────────────────────────────────
+        skew = position * self.SKEW_FACTOR
+        our_bid = round(mid - self.OFFSET - max(0.0, skew))
+        our_ask = round(mid + self.OFFSET - min(0.0, skew))
 
-        # ---- exits first (mirrors backtest order) ----
-        if best_bid >= mean and position > 0:
-            # Exit long: sell at bid
-            max_sell = limit + position
-            size = min(position, bid_vol, max_sell)
-            if size > 0:
-                orders.append(Order("TOMATOES", best_bid, -size))
-            # Don't enter on the same tick as an exit
-            return orders, trader_state
+        if our_bid >= our_ask:
+            our_bid = round(mid) - 1
+            our_ask = round(mid) + 1
 
-        if best_ask <= mean and position < 0:
-            # Exit short: buy at ask
-            max_buy = limit - position
-            size = min(abs(position), ask_vol, max_buy)
-            if size > 0:
-                orders.append(Order("TOMATOES", best_ask, size))
-            # Don't enter on the same tick as an exit
-            return orders, trader_state
+        # ── available room on each side ───────────────────────────────────────
+        room_long = self.SOFT_LIMIT - position
+        room_short = self.SOFT_LIMIT + position
 
-        # ---- entries only if flat (no exit happened above) ----
-        if position == 0:
-            if best_ask <= lower:
-                # Buy signal — price at lower band
-                size = min(self.MAX_TRADE_SIZE, ask_vol, limit)
-                if size > 0:
-                    orders.append(Order("TOMATOES", best_ask, size))
+        # ── BB trend filter ───────────────────────────────────────────────────
+        trend_suppresses_buy = mid >= upper
+        trend_suppresses_sell = mid <= lower
 
-            elif best_bid >= upper:
-                # Short signal — price at upper band
-                size = min(self.MAX_TRADE_SIZE, bid_vol, limit)
-                if size > 0:
-                    orders.append(Order("TOMATOES", best_bid, -size))
+        # ── BUY limit order ───────────────────────────────────────────────────
+        if room_long > 0 and not trend_suppresses_buy and our_bid >= best_bid:
+            buy_qty = min(room_long, total_ask_vol)
+            if buy_qty > 0:
+                orders.append(Order("TOMATOES", our_bid, buy_qty))
+
+        # ── SELL limit order ──────────────────────────────────────────────────
+        if room_short > 0 and not trend_suppresses_sell and our_ask <= best_ask:
+            sell_qty = min(room_short, total_bid_vol)
+            if sell_qty > 0:
+                orders.append(Order("TOMATOES", our_ask, -sell_qty))
+
+        # ── emergency flatten at hard Prosperity limit ────────────────────────
+        hard_limit = self.POSITION_LIMITS["TOMATOES"]
+        if position >= hard_limit:
+            orders.append(Order("TOMATOES", best_bid, -position))
+        elif position <= -hard_limit:
+            orders.append(Order("TOMATOES", best_ask, abs(position)))
 
         return orders, trader_state
