@@ -5,8 +5,8 @@ from typing import List
 
 class Trader:
     POSITION_LIMITS = {
-        "INTARIAN_PEPPER_ROOT": 20,
-        "ASH_COATED_OSMIUM": 20,
+        "INTARIAN_PEPPER_ROOT": 80,
+        "ASH_COATED_OSMIUM": 80,
     }
 
     # Osmium: stable mean-reverting asset
@@ -45,9 +45,11 @@ class Trader:
                 orders = self._trade_pepper(
                     order_depth, position, limit, state.timestamp
                 )
+            """
             elif product == "ASH_COATED_OSMIUM":
                 osm_fv = trader_data.get("osm_ewm", self.OSMIUM_FV)
                 orders = self._trade_osmium(order_depth, position, limit, osm_fv)
+            """
 
             result[product] = orders
 
@@ -98,14 +100,15 @@ class Trader:
         intraday_t = timestamp % 1_000_000  # 0..999999 within each day
 
         if intraday_t <= self.PEPPER_BUY_UNTIL:
-            # --- BUY PHASE: accumulate as fast as possible ---
+            # --- BUY PHASE: accumulate, but only at the best ask (ask1) ---
+            # Sweeping ask2/ask3 (~3 ticks higher) causes immediate slippage that
+            # takes hundreds of ticks of trend movement to recover. Instead we cap
+            # at the best ask price and let unfilled capacity roll to the next tick.
             buy_capacity = limit - position
-            for ask_price in sorted(order_depth.sell_orders.keys()):
-                if buy_capacity <= 0:
-                    break
-                qty = min(abs(order_depth.sell_orders[ask_price]), buy_capacity)
-                orders.append(Order("INTARIAN_PEPPER_ROOT", ask_price, qty))
-                buy_capacity -= qty
+            if buy_capacity > 0 and order_depth.sell_orders:
+                best_ask = min(order_depth.sell_orders.keys()) + 1
+                qty = min(abs(order_depth.sell_orders[best_ask]), buy_capacity)
+                orders.append(Order("INTARIAN_PEPPER_ROOT", best_ask, qty))
 
         elif intraday_t >= self.PEPPER_SELL_FROM:
             # --- SELL PHASE: liquidate the full position ---
